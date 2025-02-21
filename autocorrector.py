@@ -1,60 +1,120 @@
 import spacy
+import argparse
+import logging
+import re
+from pathlib import Path
+from dataclasses import dataclass
+from typing import Optional, Tuple
 from language_tool_python import LanguageTool
 from autocorrect import Speller
 
-def initialize_tools():
-    """
-    Initialize the grammar correction and spelling tools.
-    """
-    grammar_tool = LanguageTool('en-US')
-    speller = Speller(lang='en')
-    return grammar_tool, speller
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
-def lemmatize_verbs(text, nlp):
-    """
-    Lemmatize verbs in the input text using spaCy.
-    """
-    doc = nlp(text)
-    return ' '.join([token.lemma_ if token.pos_ == 'VERB' else token.text for token in doc])
+@dataclass
+class TextProcessor:
+    nlp: spacy.language.Language
+    grammar_tool: LanguageTool
+    speller: Speller
 
-def correct_spelling(text, speller):
-    """
-    Correct spelling errors in the input text using the Speller tool.
-    """
-    return speller(text)
+    @classmethod
+    def initialize(cls, language: str = 'en-US') -> 'TextProcessor':
+        try:
+            nlp = spacy.load("en_core_web_sm")
+            grammar_tool = LanguageTool(language)
+            speller = Speller(lang=language[:2])
+            return cls(nlp=nlp, grammar_tool=grammar_tool, speller=speller)
+        except Exception as e:
+            logger.error(f"Initialization failed: {str(e)}")
+            raise RuntimeError(f"Initialization failed: {str(e)}") from e
 
-def correct_grammar(text, grammar_tool):
-    """
-    Correct grammatical errors in the input text using LanguageTool.
-    """
-    return grammar_tool.correct(text)
+    def fix_contractions(self, text: str) -> str:
+        contractions = {
+            "dont": "don't", 
+            "doesnt": "doesn't", 
+            "isnt": "isn't", 
+            "arent": "aren't", 
+            "wasnt": "wasn't", 
+            "werent": "weren't",
+            # Add common verb forms
+            "dont like": "doesn't like",  # Third person singular
+            "dont have": "doesn't have",
+            "dont want": "doesn't want"
+        }
+        
+        # First pass: fix basic contractions
+        for wrong, correct in contractions.items():
+            text = re.sub(rf'\b{wrong}\b', correct, text, flags=re.IGNORECASE)
+        
+        # Second pass: handle subject-verb agreement
+        doc = self.nlp(text)
+        for token in doc:
+            if token.text.lower() == "don't" and token.i > 0:
+                subject = doc[token.i - 1]
+                if subject.text.lower() in ["he", "she", "it"]:
+                    text = text.replace("don't", "doesn't")
+        
+        return text
 
-def process_text(text, nlp, grammar_tool, speller):
-    """
-    Perform text processing by lemmatizing verbs, correcting spelling,
-    and correcting grammar in sequential steps.
-    """
-    text_with_corrected_tense = lemmatize_verbs(text, nlp)
-    text_with_corrected_spelling = correct_spelling(text_with_corrected_tense, speller)
-    fully_corrected_text = correct_grammar(text_with_corrected_spelling, grammar_tool)
-    return fully_corrected_text
+    def correct_spelling(self, text: str) -> str:
+        # Split text into words
+        words = text.split()
+        corrected_words = []
+        
+        for word in words:
+            # Don't correct proper nouns or contractions
+            if "'" in word or (word and word[0].isupper()):
+                corrected_words.append(word)
+            else:
+                corrected_words.append(self.speller(word))
+        
+        return " ".join(corrected_words)
+
+    def correct_grammar(self, text: str) -> str:
+        return self.grammar_tool.correct(text)
+
+    def process_text(self, text: str) -> Tuple[str, dict]:
+        changes = {}
+        
+        # Step 1: Fix contractions first
+        processed = self.fix_contractions(text)
+        if processed != text:
+            changes['contractions'] = {'original': text, 'corrected': processed}
+
+        # Step 2: Correct spelling
+        spelled = self.correct_spelling(processed)
+        if spelled != processed:
+            changes['spelling'] = {'original': processed, 'corrected': spelled}
+            processed = spelled
+
+        # Step 3: Apply grammar corrections last
+        grammar = self.correct_grammar(processed)
+        if grammar != processed:
+            changes['grammar'] = {'original': processed, 'corrected': grammar}
+            processed = grammar
+
+        return processed, changes
 
 def main():
-    """
-    Main function to process user input and display the corrected output.
-    """
-    nlp = spacy.load("en_core_web_sm")
-    grammar_tool, speller = initialize_tools()
+    processor = TextProcessor.initialize()
+    text = input("Enter text to process: ").strip()
+    if not text:
+        logger.warning("No input text provided.")
+        return
 
-    user_input = input("Enter a sentence: ")
-
-    corrected_text = process_text(user_input, nlp, grammar_tool, speller)
-
-    if corrected_text.strip() != user_input.strip():
-        print("Original:", user_input)
-        print("Corrected:", corrected_text)
+    processed_text, changes = processor.process_text(text)
+    print("\n=== Processing Results ===")
+    print(f"Original text: {text}")
+    print(f"Processed text: {processed_text}")
+    if changes:
+        print("\nChanges made:")
+        for correction_type, change in changes.items():
+            print(f"\n{correction_type.title()}:")
+            print(f"  Before: {change['original']}")
+            print(f"  After:  {change['corrected']}")
     else:
-        print("No corrections were needed. The input sentence is already correct.")
+        print("\nNo changes were necessary.")
 
 if __name__ == "__main__":
     main()
